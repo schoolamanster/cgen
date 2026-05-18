@@ -258,9 +258,10 @@ Here is the full flow, byte by byte:
 |---|---|
 | `README.md` | This document. |
 | `fetch_block.py` | Pulls an 80-byte block header from blockstream.info's public REST API. Supports fetching by height, by hash, or "the current chain tip." Optimized for speed — single HTTP call, no auth, no rate limit issues at low volume. |
-| `build_satcoin_cnf.py` | The orchestration. Calls cgen twice (once per SHA-256), splices the two CNFs together, applies the difficulty target as unit clauses, writes a single solver-ready DIMACS file. This is the "transformation" step — Bitcoin problem in, SAT problem out. |
+| `build_satcoin_cnf.py` | The orchestration. Calls cgen twice (once per SHA-256), splices the two CNFs together, applies the **exact Bitcoin target constraint** (`hash ≤ target`) via a 256-aux-var leading-equality cascade, writes a single solver-ready DIMACS file. This is the "transformation" step — Bitcoin problem in, SAT problem out. |
 | `submit_block.py` | The redemption path. Takes a SAT solver's `s SATISFIABLE` output, parses out the nonce, verifies the resulting block locally with double-SHA-256, and (if a Bitcoin Core node is configured) calls `bitcoin-cli submitblock` to broadcast it. Without a node it stops at "valid block constructed, ready to submit." |
-| `tests/test_genesis.py` | Sanity test using the Bitcoin genesis block (height 0). Difficulty is low enough that the encoded problem is solvable in seconds with the nonce *blanked out and re-solved*. Verifies the pipeline produces the correct intermediate and final hashes. |
+| `bench.py` | Times fetch / conversion / redemption phases across several blocks. |
+| `tests.py` | **End-to-end correctness suite.** For each of several historical blocks (genesis, block 1, block 100,000), runs three tests: (a) **known nonce accepted** — pin the real nonce as 32 unit clauses; solver must return SAT. (b) **wrong nonce rejected** — pin a nonce hashlib has independently confirmed produces an invalid hash; solver must return UNSAT. The wrong-nonce case is the *endianness canary*: a flipped byte order in the target cascade would silently make the wrong nonce look valid. (c) **redemption roundtrip** — feed a synthetic SAT log with the known nonce bits through `submit_block.py`; the recovered hash must match the canonical Bitcoin display hash for that block. Run with `python tests.py`. |
 
 <a id="how-to-run"></a>
 ## 6. How to run it
