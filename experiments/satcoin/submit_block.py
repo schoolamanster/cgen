@@ -152,8 +152,9 @@ def main() -> int:
                    help="The header JSON used to build the CNF.")
     p.add_argument("--solver-output", required=True,
                    help="Path to file containing solver output, or '-' for stdin.")
-    p.add_argument("--difficulty-bits", type=int,
-                   help="The N used when building the CNF (for verification).")
+    p.add_argument("--target", type=str, default=None,
+                   help="Target the CNF was built against (default: read from header). "
+                        "If you used --target when building the CNF, pass the same value here.")
     args = p.parse_args()
 
     with open(args.header) as f:
@@ -184,6 +185,11 @@ def main() -> int:
     leading_zeros = leading_zero_bits_be(h)
     displayed_hash = h[::-1].hex()
 
+    # Verify against the target the CNF was actually built with.
+    target_used = args.target if args.target else header["fields"]["target"]
+    meets_encoded = meets_bitcoin_target(h, target_used)
+    meets_real = meets_bitcoin_target(h, header["fields"]["target"])
+
     print(json.dumps({
         "nonce_bytes_network_order_hex": nonce_be.to_bytes(4, "big").hex(),
         "nonce_as_little_endian_int": nonce_le_int,  # how block explorers display the nonce
@@ -191,24 +197,22 @@ def main() -> int:
         "double_sha256_raw_hex": h.hex(),
         "double_sha256_displayed_hex": displayed_hash,
         "leading_zero_bits_in_BE_hash": leading_zeros,
-        "meets_real_bitcoin_target": meets_bitcoin_target(h, header["fields"]["target"]),
+        "target_used_for_encoding": target_used,
+        "meets_encoded_target": meets_encoded,
+        "meets_real_bitcoin_target": meets_real,
     }, indent=2))
 
-    if args.difficulty_bits is not None:
-        if leading_zeros < args.difficulty_bits:
-            sys.exit(
-                f"\n[verify] FAIL: encoding asserted top {args.difficulty_bits} bits = 0, "
-                f"but recovered hash has only {leading_zeros} leading zero bits in BE.\n"
-                "         This means the splice/encoding has a bug — debug before trusting.",
-            )
-        print(f"\n[verify] OK: hash has {leading_zeros} leading zero bits, "
-              f"satisfying the encoded constraint of ≥ {args.difficulty_bits}.",
-              file=sys.stderr)
+    if not meets_encoded:
+        sys.exit(
+            f"\n[verify] FAIL: encoded constraint was hash <= {target_used}, "
+            f"but hashlib-recomputed hash does NOT satisfy it.\n"
+            "         This means the CNF splice/encoding has a bug — debug before trusting."
+        )
+    print("\n[verify] OK: hashlib confirms the solver's nonce satisfies the encoded target.",
+          file=sys.stderr)
 
-    # Real submission path is dead code in our experiment but let's at least
-    # print what would happen if someone wanted to try.
-    if meets_bitcoin_target(h, header["fields"]["target"]):
-        print("\n[!] This hash meets the REAL Bitcoin target for this block.", file=sys.stderr)
+    if meets_real:
+        print("\n[!] This hash also meets the REAL Bitcoin target for this block.", file=sys.stderr)
         maybe_submit(reconstructed.hex())
     return 0
 

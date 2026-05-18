@@ -45,22 +45,28 @@ def run(*args, capture=True):
     return r
 
 
-def benchmark(label: str, fetch_args: list[str], difficulty_bits: int = 8):
+def benchmark(label: str, fetch_args: list[str], synthetic_target: str | None = None):
+    """Time fetch + conversion (+ redemption when we have a solver log).
+
+    `synthetic_target` lets us produce a solvable instance for redemption
+    timing — at the real Bitcoin target the solver doesn't terminate, so
+    we override the target for the *solve* step only. The fetch and
+    conversion timings reported are with the real network target.
+    """
     print(f"\n=== {label} ===")
     header_path = OUT / f"header_{label}.json"
     cnf_path = OUT / f"satcoin_{label}.cnf"
     solver_log = OUT / f"solver_{label}.log"
 
-    with time_block("fetch              ") as t:
+    with time_block("fetch                              ") as t:
         r = run("fetch_block.py", *fetch_args)
         header_path.write_text(r.stdout)
     header = json.loads(header_path.read_text())
     print(f"     -> height={header['block_height']} hash={header['block_hash'][:24]}...")
 
-    with time_block("conversion (cgen x2 + splice + pin)") as t:
+    with time_block("conversion (cgen x2 + splice + target)") as t:
         run("build_satcoin_cnf.py",
             "--header", str(header_path),
-            "--difficulty-bits", str(difficulty_bits),
             "--output", str(cnf_path))
     n_vars, n_clauses = None, None
     with open(cnf_path) as f:
@@ -68,34 +74,41 @@ def benchmark(label: str, fetch_args: list[str], difficulty_bits: int = 8):
             if line.startswith("p cnf"):
                 _, _, n_vars, n_clauses = line.split()
                 break
-    print(f"     -> {n_vars} vars, {n_clauses} clauses @ difficulty={difficulty_bits}")
+    real_target = header['fields']['target']
+    print(f"     -> {n_vars} vars, {n_clauses} clauses @ real target {real_target[:18]}...")
 
-    # For the redemption timing we need *some* solver output. We solve only
-    # for difficulty=4 (always quick); for higher difficulty we just feed
-    # back the same solver result, which exercises the parser identically.
-    if difficulty_bits <= 4 or label == "genesis":
-        # Solve once, low difficulty, just to have a real `v ...` line set.
-        low_cnf = OUT / f"satcoin_{label}_low.cnf"
+    # Redemption timing needs a real solver output to parse. The real target
+    # won't terminate in any reasonable wall-time, so for THIS measurement
+    # only we relax the target enough to be solvable in seconds. The
+    # redemption code path is identical either way — it parses `v` lines,
+    # extracts the nonce, hashlib-verifies. So the timing is representative.
+    if synthetic_target is not None:
+        easy_cnf = OUT / f"satcoin_{label}_easy.cnf"
         run("build_satcoin_cnf.py",
             "--header", str(header_path),
-            "--difficulty-bits", "4",
-            "--output", str(low_cnf))
+            "--target", synthetic_target,
+            "--output", str(easy_cnf))
         subprocess.run([
             str(HERE.parent.parent / "tools" / "cryptominisat" / "cryptominisat5.exe"),
-            "--verb", "0", str(low_cnf),
+            "--verb", "0", str(easy_cnf),
         ], stdout=open(solver_log, "w"), stderr=subprocess.DEVNULL, cwd=HERE)
 
     if solver_log.exists():
-        with time_block("redemption (parse + verify)        ") as t:
+        with time_block("redemption (parse + verify)           ") as t:
             run("submit_block.py",
                 "--header", str(header_path),
                 "--solver-output", str(solver_log),
-                "--difficulty-bits", "4")
+                "--target", synthetic_target)
     else:
-        print("  redemption         : skipped (no solver output for this label)")
+        print("  redemption                          : skipped (no solver output for this label)")
 
 
 if __name__ == "__main__":
-    benchmark("genesis", ["--height", "0"])
+    # For redemption timing, give the *genesis* benchmark a relaxed synthetic
+    # target (~12 zeros) so we get a real solver assignment to parse. The
+    # other blocks use the real network target; their conversion is timed
+    # but redemption is skipped (the real-target solver doesn't terminate).
+    benchmark("genesis", ["--height", "0"],
+              synthetic_target="0x000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
     benchmark("recent_easy", ["--height", "100000"])
     benchmark("current_tip", ["--tip"])

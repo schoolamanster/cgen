@@ -1,35 +1,43 @@
 """Build a satcoin SAT instance from a Bitcoin block header.
 
-This script is the centerpiece: it turns the Bitcoin mining problem into a
-single DIMACS CNF that any SAT solver can consume.
+Turns the Bitcoin mining problem into a single DIMACS CNF that any SAT
+solver can consume. The encoded constraint is the EXACT Bitcoin rule —
+"double-SHA-256(header) ≤ target" — not a relaxed leading-zero
+approximation. The academic operating assumption is that the SAT solver
+takes zero time; under that assumption the rest of the pipeline must be
+production-grade so the (hypothetical) solved nonce can be redeemed.
 
-Pipeline (see ./README.md § 4 for the detailed bit-flow diagram):
+Pipeline (see ./README.md § 4 for the bit-flow diagram):
 
-    1. Read a header JSON from fetch_block.py.
+    1. Read a header JSON from fetch_block.py (includes the 256-bit target).
     2. Call cgen to encode "SHA-256 of the 80-byte header, with the 4-byte
        nonce left free as SAT variables" → CNF₁.
     3. Call cgen to encode "SHA-256 of a 256-bit free message (padded for
        SHA-256), where the message variables will become the splice point"
-       → CNF₂.
+       → CNF₂. This second encoding is block-independent and is cached
+       in .cache/ after the first run.
     4. Splice CNF₁ and CNF₂: identify the named variable H in CNF₁ (the
        first hash's output bits) and named variable M in CNF₂ (the second
        hash's input bits), and rewrite CNF₂'s clauses so that its M
        variables are replaced by CNF₁'s H variables. Renumber CNF₂'s
        remaining variables so they don't collide.
-    5. Append unit clauses fixing the top N bits of CNF₂'s H (the final
-       hash output) to zero. This is the difficulty target.
+    5. Allocate 256 fresh auxiliary variables (s_0..s_255 — the
+       "still-equal-to-target" cascade) and append the clauses that
+       encode "double-SHA-256(header) ≤ target" exactly. Bit-by-bit
+       leading-equality + first-difference decomposition.
     6. Write the combined CNF.
 
-Endianness note: this script enforces "top N bits of SHA-256 output = 0"
-interpreting SHA-256's output as a big-endian 256-bit integer. Bitcoin's
-actual target comparison uses the *byte-reversed* hash. For the academic
-question "can SAT find a preimage with N leading bits zero", these are
-structurally equivalent. For *exact* Bitcoin difficulty matching, see
-submit_block.py's verification step, which uses standard Python hashlib.
+Endianness note: SHA-256 returns 32 bytes that Bitcoin treats as a 256-bit
+integer in *byte-reversed* order. The hash bits as cgen names them in H
+are MSB-first within each 32-bit word, and the words are H[0]..H[7] in
+that order — which matches SHA-256's serialization. The target value
+returned by fetch_block.py is already big-endian as a 256-bit integer;
+the comparison "hash ≤ target" is done on integers, sidestepping the
+byte-reverse confusion entirely. submit_block.py independently verifies
+with hashlib using Bitcoin's actual byte order.
 
 Usage:
-    python build_satcoin_cnf.py --header out/header.json \
-        --difficulty-bits 8 --output out/satcoin.cnf
+    python build_satcoin_cnf.py --header out/header.json --output out/satcoin.cnf
 """
 
 from __future__ import annotations
@@ -308,10 +316,69 @@ def _iter_clauses(cnf_path: Path):
             yield literals
 
 
+def _target_le_clauses(h2_remapped: list, target_int: int, base_var: int):
+    """Encode 'h2 <= target' exactly as CNF clauses.
+
+    h2_remapped : 256 signed ints, MSB first, in the combined CNF's namespace.
+    target_int  : 256-bit unsigned int — the network's target for this block.
+    base_var    : next free variable number; we'll allocate 256 fresh aux vars
+                  s_0..s_255 starting here. (s_i means "h[0..i-1] == t[0..i-1]".)
+
+    Returns (clauses, n_aux). The encoding follows the standard
+    leading-equality + first-difference decomposition:
+
+        s_0 = TRUE
+        for i = 0..255:
+            if t_i = 0:  forbid (s_i AND h_i = 1)  ; clause (-s_i, -h_i)
+            for i < 255: define s_{i+1} ↔ (s_i AND (h_i XNOR t_i))
+
+    'h <= t' holds iff for every i where s_i is true, either we never
+    encounter t_i=0 with h_i=1 (we either stay equal or transition to h<t
+    on a t_i=1 bit). The encoding makes any h>t assignment unsatisfiable.
+    """
+    if all(isinstance(b, int) for b in h2_remapped) is False:
+        sys.exit("h2 has non-variable bits; this encoding assumes all 256 H₂ bits are SAT variables.")
+    if not (0 <= target_int < (1 << 256)):
+        sys.exit("target_int out of 256-bit range")
+
+    target_bits = [(target_int >> (255 - i)) & 1 for i in range(256)]
+    s = [base_var + i for i in range(256)]  # s_0..s_255
+    clauses: list[list[int]] = []
+
+    # s_0 := TRUE (unit clause).
+    clauses.append([s[0]])
+
+    for i in range(256):
+        h_i = h2_remapped[i]
+        s_i = s[i]
+        if target_bits[i] == 0:
+            # If we're still equal and the hash has a 1 here, hash > target.
+            # Forbid that combination.
+            clauses.append([-s_i, -h_i])
+        if i < 255:
+            s_next = s[i + 1]
+            # "Stayed equal" at bit i: t_i = h_i.
+            #   t_i = 1 → x = h_i  (we stayed equal iff h_i was also 1)
+            #   t_i = 0 → x = -h_i (we stayed equal iff h_i was also 0)
+            x = h_i if target_bits[i] == 1 else -h_i
+            # s_next ↔ (s_i ∧ x): three clauses.
+            clauses.append([-s_next, s_i])
+            clauses.append([-s_next, x])
+            clauses.append([-s_i, -x, s_next])
+
+    return clauses, 256
+
+
 def splice_cnfs(cnf1_path: Path, cnf2_path: Path, out_path: Path,
                 h1_bits: list, m2_bits: list, h2_bits: list,
-                difficulty_bits: int):
-    """Concatenate CNF₁ and CNF₂ with M₂ substituted by H₁, then pin H₂.
+                h2_bits_bitcoin_order: list,
+                target_int: int):
+    """Concatenate CNF₁ and CNF₂ with M₂ substituted by H₁, then encode
+    'hash <= target' exactly.
+
+    `h2_bits_bitcoin_order` is h2 reordered to match Bitcoin's
+    byte-reversed integer interpretation, MSB first. This is what we
+    actually compare to the target.
 
     Variable renumbering:
       - CNF₁'s variables 1..N₁ keep their numbers.
@@ -320,29 +387,23 @@ def splice_cnfs(cnf1_path: Path, cnf2_path: Path, out_path: Path,
       - CNF₂'s remaining variables 257..N₂ are shifted by (N₁ - 256), so
         they land in N₁+1..N₁+(N₂-256). No collision with CNF₁.
 
-    Difficulty target:
-      - The top `difficulty_bits` entries of h2_bits (after remapping into
-        CNF₁'s namespace via the same shift) are pinned to 0 with unit
-        clauses. h2_bits[0] is the MSB of the first H word.
+    Target constraint:
+      - 256 fresh aux variables (s_0..s_255) track the "still-equal" prefix
+        between the hash and the network target. A cascade of CNF clauses
+        forces any model with hash > target to be UNSAT. This is the exact
+        Bitcoin rule, not an approximation.
     """
     n1_vars, n1_clauses = _parse_dimacs_header(cnf1_path)
     n2_vars, n2_clauses = _parse_dimacs_header(cnf2_path)
 
-    # Verify the splice shape.
     if len(m2_bits) < 256:
         sys.exit(f"CNF₂ M has {len(m2_bits)} bits, need at least 256")
     if len(h1_bits) != 256:
         sys.exit(f"CNF₁ H has {len(h1_bits)} bits, expected 256")
     if len(h2_bits) != 256:
         sys.exit(f"CNF₂ H has {len(h2_bits)} bits, expected 256")
-    if difficulty_bits < 0 or difficulty_bits > 256:
-        sys.exit(f"difficulty-bits must be in [0, 256], got {difficulty_bits}")
 
-    # Build CNF₂-variable → substitute-literal map.
-    # m2_bits[i] is a signed int (positive var, negative ¬var) referencing
-    # CNF₂'s variable space; we want any literal pointing at the same
-    # variable to be replaced with the matching h1_bits[i] in CNF₁'s space.
-    subst = {}  # cnf2_var (positive) -> signed literal in combined namespace
+    subst = {}
     for i in range(256):
         m2 = m2_bits[i]
         h1 = h1_bits[i]
@@ -350,9 +411,6 @@ def splice_cnfs(cnf1_path: Path, cnf2_path: Path, out_path: Path,
             sys.exit(f"Bit {i}: M₂={m2!r}, H₁={h1!r} — splice expects both to be variable literals")
         m2_var = abs(m2)
         m2_sign = 1 if m2 > 0 else -1
-        # Whatever h1 is, it's signed in CNF₁'s namespace. If M₂'s literal
-        # at this bit was negated, we invert h1's sign so that the *value*
-        # of the bit is preserved.
         subst[m2_var] = m2_sign * h1
 
     shift = n1_vars - 256
@@ -364,32 +422,34 @@ def splice_cnfs(cnf1_path: Path, cnf2_path: Path, out_path: Path,
             return sign * subst[v]
         return sign * (v + shift)
 
-    # Compute the new variable numbers of H₂ (the final output bits).
     h2_remapped = [
         b if not isinstance(b, int) else remap_lit(b)
         for b in h2_bits
     ]
+    h2_bitcoin_remapped = [
+        b if not isinstance(b, int) else remap_lit(b)
+        for b in h2_bits_bitcoin_order
+    ]
 
-    # Write the combined CNF.
-    n_total_vars = n1_vars + (n2_vars - 256)
-    extra_unit_clauses = sum(1 for i in range(difficulty_bits)
-                              if isinstance(h2_remapped[i], int))
-    n_total_clauses = n1_clauses + n2_clauses + extra_unit_clauses
+    # Combined variable count, before allocating target-encoding aux vars.
+    n_pre_target = n1_vars + (n2_vars - 256)
+
+    target_clauses, n_target_aux = _target_le_clauses(
+        h2_bitcoin_remapped, target_int, base_var=n_pre_target + 1)
+
+    n_total_vars = n_pre_target + n_target_aux
+    n_total_clauses = n1_clauses + n2_clauses + len(target_clauses)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as out:
-        out.write(f"c Satcoin spliced CNF\n")
+        out.write("c Satcoin spliced CNF — hash <= target (exact)\n")
         out.write(f"c   CNF1: {cnf1_path.name} ({n1_vars} vars, {n1_clauses} cls)\n")
         out.write(f"c   CNF2: {cnf2_path.name} ({n2_vars} vars, {n2_clauses} cls)\n")
         out.write(f"c   M2 (256 bits) substituted with H1 (sign-aware)\n")
         out.write(f"c   CNF2 non-M vars shifted by {shift}\n")
-        out.write(f"c   Top {difficulty_bits} bits of H2 pinned to 0\n")
-        # Annotation comments that submit_block.py reads to recover the nonce.
-        # The first 32 entries of CNF1's M (after parsing) won't be at fixed
-        # positions; instead the 32 nonce variables are exactly the first 32
-        # positive ints assigned by cgen → they are variables 1..32 in CNF1.
-        # We record this here for downstream tools.
-        out.write(f"c nonce_vars 1..32 (CNF1 numbering, preserved in combined)\n")
+        out.write(f"c   target = 0x{target_int:064x}\n")
+        out.write(f"c   target encoding: {n_target_aux} aux vars (s_0..s_255), {len(target_clauses)} clauses\n")
+        out.write("c nonce_vars 1..32 (CNF1 numbering, preserved in combined)\n")
         out.write(f"c h2_remapped {' '.join(str(b) for b in h2_remapped)}\n")
         out.write(f"p cnf {n_total_vars} {n_total_clauses}\n")
 
@@ -405,16 +465,10 @@ def splice_cnfs(cnf1_path: Path, cnf2_path: Path, out_path: Path,
             out.write(" ".join(str(remap_lit(L)) for L in clause))
             out.write(" 0\n")
 
-        # Difficulty pins: top `difficulty_bits` of H₂ = 0.
-        for i in range(difficulty_bits):
-            b = h2_remapped[i]
-            if isinstance(b, int):
-                # Negate to force the bit to 0 (a positive literal asserts the
-                # variable is TRUE, so the negation asserts FALSE).
-                out.write(f"{-b} 0\n")
-            # If a constant bit, it's already 0 or 1 — nothing to assert.
-            # (For SHA-256, H bits are essentially never determined as constants
-            # in our partially-fixed encoding, but defending against it is cheap.)
+        # 'hash <= target' cascade.
+        for clause in target_clauses:
+            out.write(" ".join(str(L) for L in clause))
+            out.write(" 0\n")
 
     print(f"Wrote {out_path} ({n_total_vars} vars, {n_total_clauses} clauses)", file=sys.stderr)
 
@@ -427,10 +481,12 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--header", required=True, type=Path,
                    help="JSON file from fetch_block.py")
-    p.add_argument("--difficulty-bits", type=int, default=8,
-                   help="How many top bits of the final hash must be zero (default: 8)")
     p.add_argument("--output", required=True, type=Path,
                    help="Where to write the final combined CNF")
+    p.add_argument("--target", type=str, default=None,
+                   help="Override the network target as a 256-bit hex string "
+                        "(default: use the 'bits'-derived target from the header). "
+                        "Useful for testing the encoding against synthetic targets.")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Don't delete CNF1/CNF2 after splicing")
     args = p.parse_args()
@@ -471,9 +527,34 @@ def main() -> int:
     m2_bits = read_named_var(cnf2, "M")
     h2_bits = read_named_var(cnf2, "H")
 
+    target_str = args.target if args.target else header["fields"]["target"]
+    if target_str.startswith("0x") or target_str.startswith("0X"):
+        target_str = target_str[2:]
+    try:
+        target_int = int(target_str, 16)
+    except ValueError:
+        sys.exit(f"Invalid target hex: {target_str!r}")
+
+    # Endianness reconciliation. Bitcoin compares
+    #   int.from_bytes(sha256_output_bytes, 'little')  ≤  target
+    # cgen's flattened H bits represent the SHA-256 output bytes in their
+    # *native* (big-endian) order: bit i of h2_bits corresponds to bit i of
+    # int.from_bytes(sha256_output_bytes, 'big').
+    # We must therefore *reorder* h2_bits before comparison: take 8-bit
+    # chunks (one per output byte), reverse the chunk order, concatenate.
+    # The result is the bit-by-bit representation of Bitcoin's integer,
+    # MSB first, which is what _target_le_clauses expects.
+    chunks = [h2_bits[8 * k : 8 * k + 8] for k in range(32)]
+    h2_bitcoin_order = []
+    for chunk in reversed(chunks):
+        h2_bitcoin_order.extend(chunk)
+    if len(h2_bitcoin_order) != 256:
+        sys.exit(f"Reordered H has {len(h2_bitcoin_order)} bits, expected 256")
+
     splice_cnfs(cnf1, cnf2, args.output,
-                h1_bits=h1_bits, m2_bits=m2_bits, h2_bits=h2_bits,
-                difficulty_bits=args.difficulty_bits)
+                h1_bits=h1_bits, m2_bits=m2_bits,
+                h2_bits=h2_bits, h2_bits_bitcoin_order=h2_bitcoin_order,
+                target_int=target_int)
 
     if not args.keep_intermediates:
         cnf1.unlink(missing_ok=True)

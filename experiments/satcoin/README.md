@@ -4,15 +4,22 @@ This directory is the academic experiment described by Jonathan Heusser's
 ["SAT Solving — An Alternative to Brute Force Bitcoin Mining" (2013)](https://jheusser.github.io/2013/02/03/satcoin.html),
 rebuilt on top of CGen for current SHA-256 encoding and modern tooling.
 
-The point of the experiment is **not to mine Bitcoin**. It is to translate a
-real-world problem — finding a nonce that makes a block hash valid — into
-the most general NP-complete problem (Boolean satisfiability) and study
-what that translation looks like.
+## Operating assumption: the "0-second solver"
 
-If by some miracle a SAT solver did find a winning nonce, the infrastructure
-in this directory is wired up to submit the block to the network. That path
-is real but the probability of taking it is mathematically indistinguishable
-from zero — see [§ Reality Check](#reality-check) below.
+The academic framing of this project is **assume the SAT solver finds a
+satisfying assignment in zero seconds.** Under that assumption, the only
+parts of the pipeline that contribute to "time to mine a block" are the
+fetch (get the live problem from the network) and the redemption (verify
+the solution and submit it). Everything in this codebase is built around
+that assumption: the fetch and redemption phases are optimized to the
+floor; the conversion-to-CNF phase is the bridge; the solver itself is
+treated as an oracle that returns instantly.
+
+In real life, no such oracle exists — the solver is the part that takes
+forever, and `experiments/satcoin/tests/` shows the encoding produces a
+correct CNF that any solver could in principle terminate on. But the
+*infrastructure* is built for the world where it returns instantly,
+because that's the world where each phase's optimization matters.
 
 ---
 
