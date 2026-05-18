@@ -251,28 +251,48 @@ def main() -> int:
 
     if meets_real:
         print("\n[!] This hash also meets the REAL Bitcoin target for this block.", file=sys.stderr)
-        if args.submit:
-            # Submission via RPC. Note: this submits just the 80-byte header,
-            # which the node will reject unless followed by a properly-formed
-            # full block. A real "we found a block" flow needs the full block
-            # hex (header + coinbase tx + other txns matching the merkle root)
-            # — typically obtained from getblocktemplate. The hook below is
-            # ready for that hex; we currently only have the header.
+        # Build the bytes we'd actually submit. If the header_json came from
+        # block_template.py (live mining flow), it includes full_block_hex
+        # containing the coinbase + all transactions. We splice the recovered
+        # 80-byte header into the front; the rest of the block body stays as
+        # the template gave it. If only a header is available (historical
+        # fetch_block.py mode), there's no body to submit — the node would
+        # reject it.
+        if "full_block_hex" in header:
+            full_old = bytes.fromhex(header["full_block_hex"])
+            assembled = reconstructed + full_old[80:]
+            block_to_submit_hex = assembled.hex()
+            print(
+                f"[submit] Assembled full block ({len(assembled)} bytes, "
+                f"coinbase pays to {header.get('payout_script_hex', '?')[:24]}...).",
+                file=sys.stderr,
+            )
+        else:
+            block_to_submit_hex = None
+            print(
+                "[submit] header_json has no full_block_hex (this is a historical "
+                "fetch, not a live template). Cannot construct a submittable block. "
+                "Use block_template.py to get a template the node will accept.",
+                file=sys.stderr,
+            )
+
+        if args.submit and block_to_submit_hex:
             print("[submit] Calling submitblock via local Bitcoin Core RPC...", file=sys.stderr)
-            result = submit_via_rpc(reconstructed.hex())
+            result = submit_via_rpc(block_to_submit_hex)
             print(f"[submit] {result['status']}: {result['detail']}", file=sys.stderr)
             if result["status"] != "accepted":
-                # Most likely reason for a header-only submit: node rejects
-                # because there's no body. That's expected without a full
-                # block template. We surface the rejection so it's not silent.
                 sys.exit(1)
+        elif args.submit:
+            sys.exit("[submit] --submit requested but no full block available; "
+                     "see message above. Refusing to broadcast incomplete data.")
         else:
             print(
-                "[submit] --submit not passed; not broadcasting. To submit:\n"
-                "         python submit_block.py ... --submit\n"
-                "         Caveat: submitblock needs the full block hex (header + txns),\n"
-                "         not just the header. A real mining flow constructs that from\n"
-                "         getblocktemplate; see TODO in README §8.",
+                "[submit] --submit not passed; not broadcasting. To submit a live block:\n"
+                "         1. python block_template.py > header.json   # get live template\n"
+                "         2. python build_satcoin_cnf.py --header header.json --output sat.cnf\n"
+                "         3. <run solver, get sat.log>\n"
+                "         4. python submit_block.py --header header.json "
+                "--solver-output sat.log --submit",
                 file=sys.stderr,
             )
     return 0
