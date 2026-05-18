@@ -473,6 +473,81 @@ def splice_cnfs(cnf1_path: Path, cnf2_path: Path, out_path: Path,
     print(f"Wrote {out_path} ({n_total_vars} vars, {n_total_clauses} clauses)", file=sys.stderr)
 
 
+def splice_cnfs_with_pinned_hash(cnf1_path: Path, cnf2_path: Path, out_path: Path,
+                                 h1_bits: list, m2_bits: list, h2_bits: list,
+                                 h2_bits_bitcoin_order: list,
+                                 pinned_hash_bits: list, pinned_hash_hex: str):
+    """Same splice as splice_cnfs() but replaces the target cascade with 256
+    unit clauses pinning each output bit. Smaller CNF (no aux vars).
+
+    pinned_hash_bits: 256 ints (0 or 1), MSB-first in Bitcoin display order
+                      — matches h2_bits_bitcoin_order's ordering.
+    """
+    n1_vars, n1_clauses = _parse_dimacs_header(cnf1_path)
+    n2_vars, n2_clauses = _parse_dimacs_header(cnf2_path)
+
+    if len(pinned_hash_bits) != 256:
+        sys.exit(f"pinned_hash_bits has {len(pinned_hash_bits)} bits, expected 256")
+    if len(h2_bits_bitcoin_order) != 256:
+        sys.exit(f"h2_bits_bitcoin_order has {len(h2_bits_bitcoin_order)} bits, expected 256")
+
+    # Same M-to-H₁ substitution as splice_cnfs.
+    subst = {}
+    for i in range(256):
+        m2 = m2_bits[i]
+        h1 = h1_bits[i]
+        m2_var = abs(m2)
+        m2_sign = 1 if m2 > 0 else -1
+        subst[m2_var] = m2_sign * h1
+    shift = n1_vars - 256
+
+    def remap_lit(L):
+        v = abs(L)
+        sign = 1 if L > 0 else -1
+        if v in subst:
+            return sign * subst[v]
+        return sign * (v + shift)
+
+    h2_remapped = [remap_lit(b) for b in h2_bits_bitcoin_order]
+    n_total_vars = n1_vars + (n2_vars - 256)
+
+    # One unit clause per bit. Force literal h_i to the required polarity.
+    pin_clauses: list[list[int]] = []
+    for i in range(256):
+        want_bit = pinned_hash_bits[i]
+        lit = h2_remapped[i]
+        # +lit forces bit = 1, -lit forces bit = 0.
+        pin_clauses.append([lit if want_bit == 1 else -lit])
+
+    n_total_clauses = n1_clauses + n2_clauses + len(pin_clauses)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as out:
+        out.write("c Satcoin spliced CNF — hash = pinned value (no target cascade)\n")
+        out.write(f"c   CNF1: {cnf1_path.name} ({n1_vars} vars, {n1_clauses} cls)\n")
+        out.write(f"c   CNF2: {cnf2_path.name} ({n2_vars} vars, {n2_clauses} cls)\n")
+        out.write(f"c   M2 (256 bits) substituted with H1 (sign-aware)\n")
+        out.write(f"c   CNF2 non-M vars shifted by {shift}\n")
+        out.write(f"c   pinned hash = 0x{pinned_hash_hex} (Bitcoin display order)\n")
+        out.write(f"c   pinned via {len(pin_clauses)} unit clauses (no target aux vars)\n")
+        out.write("c nonce_vars 1..32 (CNF1 numbering, preserved in combined)\n")
+        out.write(f"c h2_remapped {' '.join(str(b) for b in h2_remapped)}\n")
+        out.write(f"p cnf {n_total_vars} {n_total_clauses}\n")
+        with open(cnf1_path, "r", encoding="utf-8") as f1:
+            for line in f1:
+                if not line.strip() or line.startswith("c") or line.startswith("p"):
+                    continue
+                out.write(line)
+        for clause in _iter_clauses(cnf2_path):
+            out.write(" ".join(str(remap_lit(L)) for L in clause))
+            out.write(" 0\n")
+        for clause in pin_clauses:
+            out.write(" ".join(str(L) for L in clause))
+            out.write(" 0\n")
+    print(f"Wrote {out_path} ({n_total_vars} vars, {n_total_clauses} clauses) "
+          f"[pin-hash mode]", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -493,6 +568,14 @@ def main() -> int:
                         "CNF is satisfiable iff that specific nonce satisfies the target "
                         "for this header. NOTE: pinning the nonce to 0x00000000 does NOT "
                         "make the hash zero — the hash is deterministic given the header.")
+    p.add_argument("--pin-hash", type=str, default=None,
+                   help="Pin the double-SHA-256 output to a specific 64-hex-char value "
+                        "(Bitcoin display order — what block explorers show). REPLACES the "
+                        "target cascade with 256 unit clauses (smaller CNF: -256 aux vars, "
+                        "-~770 clauses). 'all zeros' (--pin-hash 00...00, 64 zeros) asks "
+                        "'is there a nonce making the hash exactly 0?' — almost never SAT "
+                        "(1 in 2^256). Useful for academic experiments where you want to "
+                        "pin the *output* of the hash rather than constrain it ≤ target.")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Don't delete CNF1/CNF2 after splicing")
     args = p.parse_args()
@@ -557,10 +640,28 @@ def main() -> int:
     if len(h2_bitcoin_order) != 256:
         sys.exit(f"Reordered H has {len(h2_bitcoin_order)} bits, expected 256")
 
-    splice_cnfs(cnf1, cnf2, args.output,
-                h1_bits=h1_bits, m2_bits=m2_bits,
-                h2_bits=h2_bits, h2_bits_bitcoin_order=h2_bitcoin_order,
-                target_int=target_int)
+    if args.pin_hash:
+        # Pin-hash mode: skip the target cascade and pin each h2 bit directly.
+        # Smaller CNF, deterministic verification of "does some nonce produce
+        # this exact hash?". h2_bitcoin_order is MSB-first in Bitcoin display
+        # ordering, which is exactly what `--pin-hash <displayed_hash_hex>` uses.
+        hash_hex = args.pin_hash.removeprefix("0x").removeprefix("0X")
+        if len(hash_hex) != 64:
+            sys.exit(f"--pin-hash must be exactly 64 hex chars (got {len(hash_hex)})")
+        try:
+            hash_int = int(hash_hex, 16)
+        except ValueError:
+            sys.exit(f"--pin-hash is not valid hex: {args.pin_hash!r}")
+        target_bits = [(hash_int >> (255 - i)) & 1 for i in range(256)]
+        splice_cnfs_with_pinned_hash(cnf1, cnf2, args.output,
+                    h1_bits=h1_bits, m2_bits=m2_bits,
+                    h2_bits=h2_bits, h2_bits_bitcoin_order=h2_bitcoin_order,
+                    pinned_hash_bits=target_bits, pinned_hash_hex=hash_hex)
+    else:
+        splice_cnfs(cnf1, cnf2, args.output,
+                    h1_bits=h1_bits, m2_bits=m2_bits,
+                    h2_bits=h2_bits, h2_bits_bitcoin_order=h2_bitcoin_order,
+                    target_int=target_int)
 
     # Optional nonce pin. Appends 32 unit clauses to the output, fixing
     # variables 1..32 to the bits of the requested nonce value (MSB-first
