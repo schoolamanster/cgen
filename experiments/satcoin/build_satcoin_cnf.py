@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -44,6 +45,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CGEN_EXE = REPO_ROOT / "cgeno.exe"
+
+# Cache: the second-hash CNF depends only on cgen's encoding of
+# "SHA-256 of a 256-bit free message". It does NOT depend on the block.
+# So we encode it once and reuse it forever, saving one cgen subprocess
+# call (~400 ms) per block we process.
+CACHE_DIR = Path(__file__).resolve().parent / ".cache"
+SECOND_HASH_CACHE = CACHE_DIR / "second_hash.cnf"
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +449,23 @@ def main() -> int:
     cnf1 = work_dir / "_satcoin_cnf1.cnf"
     cnf2 = work_dir / "_satcoin_cnf2.cnf"
 
-    encode_first_hash(header_hex, cnf1, work_dir)
-    encode_second_hash(cnf2, work_dir)
+    # CNF₂ is block-independent — cache it. First run encodes + caches;
+    # all subsequent runs (and all parallel block processing) reuses.
+    CACHE_DIR.mkdir(exist_ok=True)
+    if not SECOND_HASH_CACHE.exists():
+        # First-time setup: encode CNF₁ and CNF₂ in parallel since they
+        # don't depend on each other. Saves another ~400 ms on cold start.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(encode_first_hash, header_hex, cnf1, work_dir)
+            f2 = pool.submit(encode_second_hash, SECOND_HASH_CACHE, CACHE_DIR)
+            f1.result(); f2.result()
+    else:
+        encode_first_hash(header_hex, cnf1, work_dir)
+
+    # Always copy/symlink the cached CNF₂ into the work dir so cleanup logic
+    # (the --keep-intermediates flag) treats both files uniformly.
+    import shutil
+    shutil.copyfile(SECOND_HASH_CACHE, cnf2)
 
     h1_bits = read_named_var(cnf1, "H")
     m2_bits = read_named_var(cnf2, "M")
