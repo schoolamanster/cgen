@@ -1,30 +1,81 @@
 """Fetch a Bitcoin block header for the satcoin experiment.
 
-Pulls an 80-byte block header from blockstream.info's public REST API and
-prints a JSON document with the raw bytes plus everything downstream tools
-need: parsed fields, the difficulty target, and the expected double-SHA-256
-(so other steps can verify their work).
+Two backends:
+  - Default: blockstream.info public REST API (no install needed).
+  - --rpc:  local Bitcoin Core JSON-RPC (much faster: ~10 ms vs ~1 s).
+            Requires bitcoind running with `server=1`. Reads
+            $APPDATA/Bitcoin/bitcoin.conf for rpcuser/rpcpassword.
 
-No external dependencies. Single HTTP call per fetch (two for --height,
-since we resolve height to hash first). No auth, no rate-limit issues at
-the volumes this experiment generates.
+Output: a JSON document with the raw 80-byte header plus parsed fields
+and the difficulty target — same schema regardless of backend.
 
 Usage:
-    python fetch_block.py --height 0
-    python fetch_block.py --hash 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
-    python fetch_block.py --tip
+    python fetch_block.py --height 0                       # blockstream API
+    python fetch_block.py --hash <hash>                    # blockstream API
+    python fetch_block.py --tip                            # blockstream API
+    python fetch_block.py --height 0 --rpc                 # local node RPC
+    python fetch_block.py --tip --rpc                      # local node RPC
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 API_BASE = "https://blockstream.info/api"
+RPC_URL = "http://127.0.0.1:8332/"
+
+
+def _rpc_creds() -> tuple[str, str]:
+    """Read rpcuser/rpcpassword from bitcoin.conf in the standard data dir."""
+    conf_path = os.path.join(os.environ.get("APPDATA", ""), "Bitcoin", "bitcoin.conf")
+    if not os.path.exists(conf_path):
+        sys.exit(f"--rpc requires {conf_path} with rpcuser/rpcpassword set")
+    user = pw = None
+    with open(conf_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("rpcuser="):
+                user = line.split("=", 1)[1]
+            elif line.startswith("rpcpassword="):
+                pw = line.split("=", 1)[1]
+    if not (user and pw):
+        sys.exit(f"rpcuser or rpcpassword missing from {conf_path}")
+    return user, pw
+
+
+def rpc_call(method: str, params: list):
+    """Single JSON-RPC POST to the local node. Returns the result field."""
+    user, pw = _rpc_creds()
+    auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+    payload = json.dumps({"jsonrpc": "1.0", "id": "satcoin", "method": method, "params": params}).encode()
+    req = urllib.request.Request(
+        RPC_URL,
+        data=payload,
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # Bitcoin Core puts JSON error details in the response body even on HTTP errors
+        try:
+            body = json.loads(e.read())
+            sys.exit(f"RPC error {e.code}: {body.get('error', body)}")
+        except Exception:
+            sys.exit(f"RPC HTTP {e.code} on {method}: {e}")
+    except urllib.error.URLError as e:
+        sys.exit(f"RPC unreachable ({RPC_URL}) — is bitcoind running? {e.reason}")
+    if body.get("error"):
+        sys.exit(f"RPC {method} returned error: {body['error']}")
+    return body["result"]
 
 
 def _http_get(url: str) -> str:
@@ -123,19 +174,35 @@ def main() -> int:
     g.add_argument("--height", type=int, help="Fetch the block at this height.")
     g.add_argument("--hash", type=str, help="Fetch the block with this hash.")
     g.add_argument("--tip", action="store_true", help="Fetch the current chain tip.")
+    p.add_argument("--rpc", action="store_true",
+                   help="Use the local Bitcoin Core RPC instead of the public API. "
+                        "Requires bitcoind running with server=1 and bitcoin.conf credentials.")
     args = p.parse_args()
 
-    if args.height is not None:
-        bh = height_to_hash(args.height)
-        height = args.height
-    elif args.hash:
-        bh = args.hash.lower()
-        height = block_height(bh)
+    if args.rpc:
+        # Local node path.
+        if args.tip:
+            bh = rpc_call("getbestblockhash", [])
+        elif args.height is not None:
+            bh = rpc_call("getblockhash", [args.height])
+        else:
+            bh = args.hash.lower()
+        raw_hex = rpc_call("getblockheader", [bh, False])  # False = serialized hex
+        info = rpc_call("getblockheader", [bh, True])      # True  = parsed object
+        height = info["height"]
     else:
-        bh = tip_hash()
-        height = block_height(bh)
+        # Public API path.
+        if args.height is not None:
+            bh = height_to_hash(args.height)
+            height = args.height
+        elif args.hash:
+            bh = args.hash.lower()
+            height = block_height(bh)
+        else:
+            bh = tip_hash()
+            height = block_height(bh)
+        raw_hex = header_hex(bh)
 
-    raw_hex = header_hex(bh)
     raw_bytes = bytes.fromhex(raw_hex)
 
     # The displayed block hash IS the double-SHA-256 of the header,

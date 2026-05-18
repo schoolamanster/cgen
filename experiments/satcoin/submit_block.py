@@ -7,37 +7,37 @@ This is the redemption path. Run it on a solver's `v ...` output to:
   3. Recompute double-SHA-256 with Python's hashlib (the canonical
      implementation — independent of cgen's CNF encoding, so this
      catches any encoding bug).
-  4. Compare against the difficulty constraint to confirm the solver
-     didn't lie or that we didn't parse wrong.
-  5. If a Bitcoin Core node is configured AND the hash actually meets
-     the *real* network target (not just our academic top-N-bits-zero),
-     prepare a submitblock call.
-
-In practice this script's job is mostly verification. The submission half
-only runs if all of these hold simultaneously:
-  - The block is unmined (--live-template mode).
-  - The hash meets the live network target.
-  - bitcoin-cli is on PATH and the local node is synced.
+  4. Compare against the network target.
+  5. With --submit, broadcast via local Bitcoin Core RPC submitblock.
+     The script verifies first; only broadcasts if hash meets the real
+     target AND the user passed --submit explicitly (no auto-broadcast).
 
 Usage:
-    # Solver wrote its output to solver.log
-    python submit_block.py --header out/header.json \\
-        --solver-output solver.log \\
-        [--difficulty-bits 8]
+    # Just verify
+    python submit_block.py --header out/header.json --solver-output sol.log
 
-    # Or feed solver output via stdin:
+    # Verify + (if winning) broadcast via local node
+    python submit_block.py --header out/header.json --solver-output sol.log --submit
+
+    # Stream from a live solver
     cryptominisat5 out/satcoin.cnf | python submit_block.py --header out/header.json -
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+RPC_URL = "http://127.0.0.1:8332/"
 
 
 def parse_solver_assignment(text: str) -> dict[int, bool]:
@@ -118,32 +118,65 @@ def meets_bitcoin_target(hash_bytes: bytes, target_hex: str) -> bool:
     return reversed_int <= target
 
 
-def maybe_submit(block_hex: str) -> None:
-    """If bitcoin-cli is on PATH, print the submit command and ask before running.
+def _rpc_creds() -> tuple[str, str]:
+    """Read rpcuser/rpcpassword from bitcoin.conf."""
+    conf_path = os.path.join(os.environ.get("APPDATA", ""), "Bitcoin", "bitcoin.conf")
+    if not os.path.exists(conf_path):
+        sys.exit(f"--submit requires {conf_path} with rpcuser/rpcpassword set")
+    user = pw = None
+    with open(conf_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("rpcuser="):
+                user = line.split("=", 1)[1]
+            elif line.startswith("rpcpassword="):
+                pw = line.split("=", 1)[1]
+    if not (user and pw):
+        sys.exit(f"rpcuser or rpcpassword missing from {conf_path}")
+    return user, pw
 
-    This script will not auto-submit anything — submission of a real block
-    is the kind of thing you don't do in an `os.system` call without
-    eyeballs on it.
-    """
-    cli = shutil.which("bitcoin-cli")
-    if not cli:
-        print(
-            "\n[submit] No bitcoin-cli on PATH — submission step skipped.\n"
-            "         To submit a found block, you'd run:\n"
-            f"         bitcoin-cli submitblock {block_hex[:32]}...{block_hex[-16:]}",
-            file=sys.stderr,
-        )
-        return
-    print(
-        "\n[submit] bitcoin-cli detected. To submit:\n"
-        f"         {cli} submitblock <full block hex>\n"
-        "         Note: only the header is reconstructed here. A real submission\n"
-        "         needs the full block (header + transactions) matching the\n"
-        "         merkle root committed in the header. That requires a node\n"
-        "         template (`getblocktemplate`) the header came from.\n"
-        "         This script does NOT auto-run submitblock.",
-        file=sys.stderr,
+
+def rpc_call(method: str, params: list):
+    """Single JSON-RPC POST. Returns the result field (or raises on RPC error)."""
+    user, pw = _rpc_creds()
+    auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+    payload = json.dumps({"jsonrpc": "1.0", "id": "satcoin", "method": method, "params": params}).encode()
+    req = urllib.request.Request(
+        RPC_URL,
+        data=payload,
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+        method="POST",
     )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+            return {"error": body.get("error", f"HTTP {e.code}"), "result": None}
+        except Exception:
+            return {"error": f"HTTP {e.code}", "result": None}
+    except urllib.error.URLError as e:
+        return {"error": f"unreachable ({RPC_URL}): {e.reason}", "result": None}
+    return body
+
+
+def submit_via_rpc(block_hex: str) -> dict:
+    """Call submitblock via local RPC. Returns {'status', 'detail'}.
+
+    submitblock semantics (per Bitcoin Core):
+      - result = null and no error → accepted by the network
+      - result = string error code → rejected (e.g. "high-hash" if hash > target,
+        "bad-prevblk" if prev hash doesn't match the current tip, etc.)
+      - HTTP/RPC error → couldn't even reach the node
+    """
+    resp = rpc_call("submitblock", [block_hex])
+    if resp.get("error"):
+        return {"status": "rpc_error", "detail": resp["error"]}
+    result = resp.get("result")
+    if result is None:
+        return {"status": "accepted", "detail": "node accepted the block; gossiped to peers"}
+    return {"status": "rejected", "detail": f"rejection reason: {result}"}
 
 
 def main() -> int:
@@ -155,6 +188,11 @@ def main() -> int:
     p.add_argument("--target", type=str, default=None,
                    help="Target the CNF was built against (default: read from header). "
                         "If you used --target when building the CNF, pass the same value here.")
+    p.add_argument("--submit", action="store_true",
+                   help="If the hash meets the real Bitcoin target, broadcast via local "
+                        "Bitcoin Core RPC. Requires bitcoind running, fully synced, and "
+                        "the block to be a valid extension of the current chain tip. "
+                        "Without --submit, the script only verifies and prints what it WOULD do.")
     args = p.parse_args()
 
     with open(args.header) as f:
@@ -213,7 +251,30 @@ def main() -> int:
 
     if meets_real:
         print("\n[!] This hash also meets the REAL Bitcoin target for this block.", file=sys.stderr)
-        maybe_submit(reconstructed.hex())
+        if args.submit:
+            # Submission via RPC. Note: this submits just the 80-byte header,
+            # which the node will reject unless followed by a properly-formed
+            # full block. A real "we found a block" flow needs the full block
+            # hex (header + coinbase tx + other txns matching the merkle root)
+            # — typically obtained from getblocktemplate. The hook below is
+            # ready for that hex; we currently only have the header.
+            print("[submit] Calling submitblock via local Bitcoin Core RPC...", file=sys.stderr)
+            result = submit_via_rpc(reconstructed.hex())
+            print(f"[submit] {result['status']}: {result['detail']}", file=sys.stderr)
+            if result["status"] != "accepted":
+                # Most likely reason for a header-only submit: node rejects
+                # because there's no body. That's expected without a full
+                # block template. We surface the rejection so it's not silent.
+                sys.exit(1)
+        else:
+            print(
+                "[submit] --submit not passed; not broadcasting. To submit:\n"
+                "         python submit_block.py ... --submit\n"
+                "         Caveat: submitblock needs the full block hex (header + txns),\n"
+                "         not just the header. A real mining flow constructs that from\n"
+                "         getblocktemplate; see TODO in README §8.",
+                file=sys.stderr,
+            )
     return 0
 
 

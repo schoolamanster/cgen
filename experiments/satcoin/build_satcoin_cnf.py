@@ -487,6 +487,12 @@ def main() -> int:
                    help="Override the network target as a 256-bit hex string "
                         "(default: use the 'bits'-derived target from the header). "
                         "Useful for testing the encoding against synthetic targets.")
+    p.add_argument("--pin-nonce", type=str, default=None,
+                   help="Pin the nonce to a specific 8-hex-char value (e.g. '00000000') "
+                        "by appending 32 unit clauses to the output CNF. The resulting "
+                        "CNF is satisfiable iff that specific nonce satisfies the target "
+                        "for this header. NOTE: pinning the nonce to 0x00000000 does NOT "
+                        "make the hash zero — the hash is deterministic given the header.")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Don't delete CNF1/CNF2 after splicing")
     args = p.parse_args()
@@ -555,6 +561,40 @@ def main() -> int:
                 h1_bits=h1_bits, m2_bits=m2_bits,
                 h2_bits=h2_bits, h2_bits_bitcoin_order=h2_bitcoin_order,
                 target_int=target_int)
+
+    # Optional nonce pin. Appends 32 unit clauses to the output, fixing
+    # variables 1..32 to the bits of the requested nonce value (MSB-first
+    # within each byte, header byte 76 → vars 1..8, etc.).
+    if args.pin_nonce:
+        nonce_hex = args.pin_nonce.removeprefix("0x").removeprefix("0X")
+        if len(nonce_hex) != 8:
+            sys.exit(f"--pin-nonce must be exactly 8 hex chars (got {len(nonce_hex)})")
+        try:
+            nonce_bytes = bytes.fromhex(nonce_hex)
+        except ValueError:
+            sys.exit(f"--pin-nonce is not valid hex: {args.pin_nonce!r}")
+        units = []
+        for byte_i, b in enumerate(nonce_bytes):
+            for bit_in_byte in range(7, -1, -1):
+                var = byte_i * 8 + (7 - bit_in_byte) + 1
+                sign = 1 if (b >> bit_in_byte) & 1 else -1
+                units.append(sign * var)
+        # Rewrite the CNF header line in place to account for the extra clauses,
+        # then append the unit clauses at the end.
+        with open(args.output, "r") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if line.startswith("p cnf"):
+                parts = line.split()
+                old_cls = int(parts[3])
+                lines[i] = f"p cnf {parts[2]} {old_cls + len(units)}\n"
+                break
+        lines.append(f"c --pin-nonce {nonce_hex}: 32 unit clauses below\n")
+        for u in units:
+            lines.append(f"{u} 0\n")
+        with open(args.output, "w") as f:
+            f.writelines(lines)
+        print(f"Pinned nonce to 0x{nonce_hex} (added 32 unit clauses)", file=sys.stderr)
 
     if not args.keep_intermediates:
         cnf1.unlink(missing_ok=True)
