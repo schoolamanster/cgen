@@ -1,0 +1,29 @@
+# Build artifacts
+*.o
+cgen
+cgeno
+cgen.exe
+cgeno.exe
+
+# CLion / CMake
+cmake-build-*/
+.idea/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile.cmake
+
+# Experiment output
+out/
+experiments/satcoin/out/
+experiments/satcoin/__pycache__/
+experiments/satcoin/.venv/
+*.cnf
+
+# Bundled tools (downloaded separately, not committed)
+tools/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
