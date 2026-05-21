@@ -1,0 +1,14 @@
+{
+  "block_height": 950419,
+  "block_hash": "000000000000000000012522f41f4811d5131bca34b7c999c72160dc3320a89e",
+  "displayed_nonce": 2605071794,
+  "header_bytes_76_79_hex": "b23d469b",
+  "cnf_size": {
+    "vars": 88006,
+    "clauses": 456024
+  },
+  "verdict": "s SATISFIABLE",
+  "solve_ms": 9601.6,
+  "recovered_nonce_from_assignment": 2605071794,
+  "all_32_bits_match": true
+}
