@@ -1,14 +1,14 @@
 {
-  "block_height": 951441,
-  "block_hash": "00000000000000000000b902ded353dd88866807448465c1c4669a003d67639a",
-  "displayed_nonce": 3034772985,
-  "header_bytes_76_79_hex": "f9f5e2b4",
+  "block_height": 951471,
+  "block_hash": "0000000000000000000148abd092d93f2e4a23ca2b229f3c597f292f568ae80b",
+  "displayed_nonce": 4036866927,
+  "header_bytes_76_79_hex": "6fb39df0",
   "cnf_size": {
-    "vars": 88019,
-    "clauses": 456035
+    "vars": 88018,
+    "clauses": 456025
   },
   "verdict": "s SATISFIABLE",
-  "solve_ms": 4409.4,
-  "recovered_nonce_from_assignment": 3034772985,
+  "solve_ms": 3821.3,
+  "recovered_nonce_from_assignment": 4036866927,
   "all_32_bits_match": true
 }
