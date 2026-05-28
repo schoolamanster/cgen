@@ -24,6 +24,8 @@ Run:
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -99,7 +101,90 @@ def parse_assignment(solver_text: str) -> dict[int, bool]:
     return a
 
 
+def write_assignment_file(path: Path, *, header: dict, assignment: dict[int, bool],
+                          solver_text: str, cnf_path: Path, n_vars: int, n_cls: int) -> dict:
+    """Dump the full SAT satisfying assignment with annotations.
+
+    Format:
+      - Header: metadata about the block, CNF, target, verdict
+      - Section A: nonce variables 1..32 with bit-position annotations
+      - Section B: all other variable assignments (one per line)
+      - Footer: raw `v ...` lines from the solver verbatim (for byte-exact reproducibility)
+      - SHA-256 of the assignment-only section for tamper detection
+
+    Use case: post-hoc verification that the pipeline really produced a
+    complete satisfying assignment for the block's CNF, not just a "PASS"
+    output. The file can be fed to any standalone SAT checker (e.g. by
+    grepping out the `<var> <0|1>` lines and converting to a DIMACS
+    assignment certificate).
+    """
+    nonce_bytes = nonce_bytes_from_header(header["raw_header_hex"])
+    body_lines: list[str] = []
+
+    body_lines.append("# === Section A: nonce variables (header bytes 76..79, MSB-first) ===")
+    for v in range(1, 33):
+        val = 1 if assignment.get(v) else 0
+        byte_offset = 76 + (v - 1) // 8
+        bit_in_byte = 7 - ((v - 1) % 8)  # MSB-first
+        body_lines.append(f"{v:>7} {val}  # bit {bit_in_byte} of header byte {byte_offset} "
+                          f"(byte = 0x{nonce_bytes[(v-1)//8]:02x})")
+
+    body_lines.append("")
+    body_lines.append(f"# === Section B: all other variables ({len(assignment) - 32:,} entries) ===")
+    for v in sorted(assignment.keys()):
+        if v <= 32:
+            continue
+        val = 1 if assignment[v] else 0
+        body_lines.append(f"{v:>7} {val}")
+
+    body_text = "\n".join(body_lines) + "\n"
+    body_sha = hashlib.sha256(body_text.encode()).hexdigest()
+
+    header_lines = [
+        f"# Satcoin SAT satisfying-assignment dump",
+        f"# block_height:      {header['block_height']}",
+        f"# block_hash:        {header['block_hash']}",
+        f"# displayed_nonce:   {header['fields']['nonce']} ({header['fields']['nonce']:,})",
+        f"# nonce_bytes_76_79: {nonce_bytes.hex()}  (network order)",
+        f"# target:            {header['fields']['target']}",
+        f"# cnf_path:          {cnf_path}",
+        f"# cnf_size:          {n_vars} vars, {n_cls} clauses",
+        f"# assignment_size:   {len(assignment)} variables",
+        f"# assignment_sha256: {body_sha}",
+        f"# format:            <variable_number> <0_or_1>  [annotation]",
+        f"#",
+        f"# Run `grep -c '^[[:space:]]*[0-9]\\+' THIS_FILE` to count rows; should equal assignment_size.",
+        f"# Run `awk '$1==1 || $1==32' THIS_FILE` to inspect the nonce endpoints.",
+        f"# Pipe the body to any DIMACS-assignment SAT checker to independently re-verify.",
+        f"",
+    ]
+
+    raw_v_lines = "\n".join(l for l in solver_text.splitlines() if l.startswith("v ")) + "\n"
+    footer_lines = [
+        "",
+        "# === Section C: raw `v ...` lines from CryptoMiniSat (verbatim) ===",
+        raw_v_lines.rstrip(),
+    ]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(header_lines) + body_text + "\n".join(footer_lines) + "\n")
+
+    return {
+        "path": str(path),
+        "assignment_size": len(assignment),
+        "assignment_sha256": body_sha,
+        "file_bytes": path.stat().st_size,
+    }
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--save-assignment", type=str, default=None, metavar="PATH",
+                        help="Dump the full SAT satisfying assignment to PATH. Use 'auto' to "
+                             "save to out/recent_winner/assignment_<height>_<hashpfx>.txt. "
+                             "Opt-in only; not written by default.")
+    args = parser.parse_args()
+
     # 1. Get current chain tip.
     tip_hash = rpc("getbestblockhash")
     chain = rpc("getblockchaininfo")
@@ -163,6 +248,21 @@ def main() -> int:
         "recovered_nonce_from_assignment": recovered,
         "all_32_bits_match": ok_recover,
     }
+    # Optional: full assignment dump for post-hoc peace-of-mind verification.
+    if args.save_assignment:
+        if args.save_assignment.lower() == "auto":
+            asg_path = OUT / f"assignment_{tip_height}_{tip_hash[:8]}.txt"
+        else:
+            asg_path = Path(args.save_assignment)
+        meta = write_assignment_file(asg_path,
+                                     header=header, assignment=assignment,
+                                     solver_text=solver_text, cnf_path=pinned_path,
+                                     n_vars=n_vars, n_cls=n_cls)
+        print(f"      Assignment dumped to:  {meta['path']}")
+        print(f"      Size: {meta['assignment_size']:,} vars, {meta['file_bytes']/1024:.1f} KB on disk")
+        print(f"      SHA-256 (body): {meta['assignment_sha256'][:16]}...")
+        summary["assignment_dump"] = meta
+
     (OUT / "summary.json").write_text(json.dumps(summary, indent=2))
     print()
     if verdict == "s SATISFIABLE" and ok_recover:

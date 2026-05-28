@@ -1,14 +1,20 @@
 {
-  "block_height": 951471,
-  "block_hash": "0000000000000000000148abd092d93f2e4a23ca2b229f3c597f292f568ae80b",
-  "displayed_nonce": 4036866927,
-  "header_bytes_76_79_hex": "6fb39df0",
+  "block_height": 951480,
+  "block_hash": "000000000000000000000307711c5de571e9b4762ed2e21db5c4445ac0704f9a",
+  "displayed_nonce": 4158730682,
+  "header_bytes_76_79_hex": "ba31e1f7",
   "cnf_size": {
-    "vars": 88018,
-    "clauses": 456025
+    "vars": 88016,
+    "clauses": 456054
   },
   "verdict": "s SATISFIABLE",
-  "solve_ms": 3821.3,
-  "recovered_nonce_from_assignment": 4036866927,
-  "all_32_bits_match": true
+  "solve_ms": 6242.0,
+  "recovered_nonce_from_assignment": 4158730682,
+  "all_32_bits_match": true,
+  "assignment_dump": {
+    "path": "C:\\Users\\dizzyvinci\\cgen_fetchredeem_optimization\\experiments\\satcoin\\out\\recent_winner\\assignment_951480_00000000.txt",
+    "assignment_size": 88016,
+    "assignment_sha256": "9cdbf1b4dd0ed38361f233cbb3b731df02d95336cf1c8400c13940c8cf4150b0",
+    "file_bytes": 1562281
+  }
 }
