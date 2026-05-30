@@ -99,23 +99,39 @@ for ($i = 0; $i -lt 10; $i++) {
     Start-Sleep -Seconds 1
 }
 
-# Step 5: fresh start.
-Log "starting fresh bitcoind hidden"
-$p = Start-Process -FilePath $BitcoindExe -WindowStyle Hidden -PassThru
-Log "started PID $($p.Id) at $(Get-Date -Format 'HH:mm:ss')"
-
-# Step 6: wait for RPC to come up + auth to work.
+# Step 5+6: fresh start + wait for RPC+auth, with one retry if the first
+# bitcoind comes up with stale RPC auth (occasionally seen when bitcoind is
+# launched from inside Task Scheduler — root cause not fully isolated, but
+# a force-kill + fresh start always recovers).
+$MAX_ATTEMPTS = 2
 $ready = $false
-for ($i = 0; $i -lt $MaxWaitS; $i++) {
-    if (Test-RpcAuth) {
-        Log "RPC up + auth OK after ${i}s"
-        $ready = $true
-        break
+for ($attempt = 1; $attempt -le $MAX_ATTEMPTS; $attempt++) {
+    if ($attempt -gt 1) {
+        Log "auth did not come up on attempt $($attempt - 1); force-killing and retrying"
+        Get-Process -Name "bitcoind" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        for ($i = 0; $i -lt 10; $i++) {
+            if (-not (Test-PortListening)) { break }
+            Start-Sleep -Seconds 1
+        }
     }
-    Start-Sleep -Seconds 1
+    Log "starting fresh bitcoind hidden (attempt $attempt / $MAX_ATTEMPTS)"
+    $p = Start-Process -FilePath $BitcoindExe -WindowStyle Hidden -PassThru
+    Log "  started PID $($p.Id) at $(Get-Date -Format 'HH:mm:ss')"
+    for ($i = 0; $i -lt $MaxWaitS; $i++) {
+        if (Test-RpcAuth) {
+            Log "  RPC up + auth OK after ${i}s on attempt $attempt"
+            $ready = $true
+            break
+        }
+        Start-Sleep -Seconds 1
+    }
+    if ($ready) { break }
+    Log "  WARNING: RPC/auth not available within ${MaxWaitS}s on attempt $attempt"
 }
 if (-not $ready) {
-    Log "WARNING: RPC did not become available within ${MaxWaitS}s. bitcoind is running but may still be loading chainstate."
+    Log "FATAL: all $MAX_ATTEMPTS attempts failed; bitcoind may be running but RPC auth is broken"
+    Log "       run scripts\launch_bitcoind.ps1 manually to retry, or investigate %APPDATA%\Bitcoin\debug.log"
 }
 
 # Bonus: confirm wallet loaded (auto-load is set via wallet=satcoin in bitcoin.conf).

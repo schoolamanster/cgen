@@ -8,13 +8,7 @@
     "clauses": 456115
   },
   "verdict": "s SATISFIABLE",
-  "solve_ms": 7630.6,
+  "solve_ms": 6026.1,
   "recovered_nonce_from_assignment": 2132827576,
-  "all_32_bits_match": true,
-  "assignment_dump": {
-    "path": "C:\\Users\\dizzyvinci\\cgen_fetchredeem_optimization\\experiments\\satcoin\\out\\recent_winner\\assignment_951752_00000000.txt",
-    "assignment_size": 88042,
-    "assignment_sha256": "34961968f30605b304b1de78e682b3509f75484c80a21d41bbe918c30b1dd690",
-    "file_bytes": 1562047
-  }
+  "all_32_bits_match": true
 }
