@@ -23,20 +23,38 @@
 
 $ErrorActionPreference = "Continue"
 
+# Diagnostic beacon: hardcoded path that always works regardless of env vars.
+# If the launcher runs at all, this line MUST appear in this file. Used to
+# diagnose situations where Task Scheduler invokes us but the regular log
+# (env-var-resolved) ends up silent.
+$_beacon = "C:\Users\dizzyvinci\AppData\Local\BitcoinAutostart\beacon.log"
+try {
+    $_d = Split-Path $_beacon -Parent
+    if (-not (Test-Path $_d)) { New-Item -ItemType Directory -Path $_d -Force | Out-Null }
+    Add-Content -Path $_beacon -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  beacon: launcher invoked, PID $PID, invoked-by: $($env:USERNAME)@$($env:COMPUTERNAME), session: $(if ($env:SESSIONNAME) { $env:SESSIONNAME } else { '?' })" -Encoding utf8 -ErrorAction SilentlyContinue
+} catch { }
+
 # --- config (tweak only if the install layout moves) ----------------------
 $BitcoindExe = "C:\Program Files\Bitcoin\bitcoin-31.0\bin\bitcoind.exe"
 $BitcoinCli  = "C:\Program Files\Bitcoin\daemon\bitcoin-cli.exe"
 $RpcPort     = 8332
-$LogDir      = Join-Path $env:LOCALAPPDATA "BitcoinAutostart"
-$LogFile     = Join-Path $LogDir "launch.log"
 $MaxWaitS    = 120  # how long to give bitcoind to come up after start
+
+# Log dir. Hardcoded path: this script lives only on dizzyvinci's machine and
+# Task-Scheduler invocations were observed to drop or interpret env vars
+# weirdly. The beacon write at the top of the script proves this path is
+# writable under both interactive and task contexts.
+$LogDir = "C:\Users\dizzyvinci\AppData\Local\BitcoinAutostart"
+if (-not (Test-Path $LogDir)) {
+    try { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null } catch { }
+}
+$LogFile = Join-Path $LogDir "launch.log"
 
 function Log {
     param([string]$msg)
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg"
     Write-Output $line
-    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-    Add-Content -Path $LogFile -Value $line -Encoding utf8
+    try { Add-Content -Path $LogFile -Value $line -Encoding utf8 -ErrorAction Stop } catch { }
 }
 
 function Test-RpcAuth {
@@ -53,6 +71,7 @@ function Test-PortListening {
 }
 
 Log "=== launch_bitcoind start ==="
+Log "log_path:   $LogFile  (LOCALAPPDATA=$($env:LOCALAPPDATA))"
 Log "executable: $BitcoindExe"
 
 # Sanity: executable exists?
