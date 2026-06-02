@@ -22,49 +22,61 @@ the reboot. A clean stop + start broke the deadlock.
 The launcher always does that clean stop + start, so the gotcha can't repeat
 even if the underlying cause is environmental.
 
-## How to wire it into Task Scheduler
+## How to wire it into autostart
 
-This step needs to be run by you (not automated) because modifying a logon-triggered
-task to execute an arbitrary PowerShell script counts as unauthorized persistence
-from the agent's perspective.
+**Current mechanism: Startup-folder shortcut** (not Task Scheduler).
 
-In an elevated-or-not PowerShell window:
+We tried a logon-triggered scheduled task first. It fired the launcher
+script — the beacon line at the top of the script confirmed it ran — but
+the bitcoind it spawned consistently came up with broken RPC auth and
+the launcher's regular log writes silently failed. Even the retry loop
+couldn't recover; both attempts produced broken bitcoinds in that
+context. The root cause is something about how bitcoind interprets its
+configuration when spawned by `Start-Process` under the task scheduler's
+"InteractiveToken" context — `$env:SESSIONNAME` is missing in that
+process and bitcoind appears to misread the conf in a way the launcher
+script can't see.
+
+The startup-folder shortcut runs the launcher at logon in a **true**
+interactive session, equivalent to the user double-clicking a shortcut
+themselves. That spawn context produces a fresh-auth bitcoind every
+time (verified by triggering the shortcut directly in the same session).
+
+To install / re-install the shortcut:
 
 ```powershell
-$taskName = "Bitcoind Satcoin Autostart"
 $launcher = "C:\Users\dizzyvinci\cgen_fetchredeem_optimization\experiments\satcoin\scripts\launch_bitcoind.ps1"
+$startup  = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
+$shortcut = Join-Path $startup "Bitcoind Satcoin Autostart.lnk"
 
-# Replace the existing task (or create fresh).
-Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
-
-$action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
-    -MultipleInstances IgnoreNew -StartWhenAvailable
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
-    -LogonType Interactive -RunLevel Limited
-
-Register-ScheduledTask -TaskName $taskName -Trigger $trigger `
-    -Action $action -Settings $settings -Principal $principal
+$wsh = New-Object -ComObject WScript.Shell
+$lnk = $wsh.CreateShortcut($shortcut)
+$lnk.TargetPath       = "powershell.exe"
+$lnk.Arguments        = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`""
+$lnk.WorkingDirectory = (Split-Path $launcher)
+$lnk.WindowStyle      = 7  # minimized
+$lnk.Description      = "Launch the satcoin experiment's local bitcoind node at logon"
+$lnk.Save()
 ```
 
-You can verify it's wired up by running the task immediately without rebooting:
+If you previously created the scheduled task, disable it so you don't
+have two autostart mechanisms fighting each other:
 
 ```powershell
-Start-ScheduledTask -TaskName "Bitcoind Satcoin Autostart"
-# Then check the launcher log:
+Disable-ScheduledTask -TaskName "Bitcoind Satcoin Autostart" -ErrorAction SilentlyContinue
+# Or fully remove:
+# Unregister-ScheduledTask -TaskName "Bitcoind Satcoin Autostart" -Confirm:$false
+```
+
+You can verify the shortcut by invoking it directly (same code path as logon):
+
+```powershell
+Invoke-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Bitcoind Satcoin Autostart.lnk"
 Get-Content "$env:LOCALAPPDATA\BitcoinAutostart\launch.log" -Tail 20
 ```
 
-To disable the autostart later:
-
-```powershell
-Unregister-ScheduledTask -TaskName "Bitcoind Satcoin Autostart" -Confirm:$false
-```
+A clean shortcut-triggered run completes in ~15-20s, ending with
+"`=== launch_bitcoind done ===`" and bitcoind RPC + auth working.
 
 ## Coverage matrix (with the hardened launcher)
 
