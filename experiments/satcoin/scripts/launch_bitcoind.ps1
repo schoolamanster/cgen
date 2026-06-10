@@ -35,10 +35,19 @@ try {
 } catch { }
 
 # --- config (tweak only if the install layout moves) ----------------------
-$BitcoindExe = "C:\Program Files\Bitcoin\bitcoin-31.0\bin\bitcoind.exe"
-$BitcoinCli  = "C:\Program Files\Bitcoin\daemon\bitcoin-cli.exe"
-$RpcPort     = 8332
-$MaxWaitS    = 120  # how long to give bitcoind to come up after start
+$BitcoindExe     = "C:\Program Files\Bitcoin\bitcoin-31.0\bin\bitcoind.exe"
+$BitcoinCli      = "C:\Program Files\Bitcoin\daemon\bitcoin-cli.exe"
+$RpcPort         = 8332
+$MaxWaitS        = 120  # how long to give bitcoind to come up after start
+
+# Pin the data directory EXPLICITLY. bitcoind v31 has been observed to
+# resolve its "default data directory" to different paths in different
+# Windows session contexts — sometimes %APPDATA%\Bitcoin (Roaming, the
+# real one with our bitcoin.conf), sometimes %LOCALAPPDATA%\Bitcoin
+# (Local, where there's NO conf so it runs unpruned + cookie auth and
+# grows to hundreds of GB). Passing -datadir defeats the guess entirely.
+$BitcoindDataDir = "C:\Users\dizzyvinci\AppData\Roaming\Bitcoin"
+$BitcoinCliArgs  = @("-datadir=`"$BitcoindDataDir`"")
 
 # Log dir. Hardcoded path: this script lives only on dizzyvinci's machine and
 # Task-Scheduler invocations were observed to drop or interpret env vars
@@ -58,9 +67,10 @@ function Log {
 }
 
 function Test-RpcAuth {
-    # Returns $true if bitcoind is up AND auth works.
+    # Returns $true if bitcoind is up AND auth works. Always pass -datadir
+    # so the cli talks to the same node our launcher started.
     try {
-        $r = & $BitcoinCli getblockcount 2>&1
+        $r = & $BitcoinCli @BitcoinCliArgs getblockcount 2>&1
         return ($LASTEXITCODE -eq 0 -and $r -match '^\d+$')
     } catch { return $false }
 }
@@ -73,6 +83,17 @@ function Test-PortListening {
 Log "=== launch_bitcoind start ==="
 Log "log_path:   $LogFile  (LOCALAPPDATA=$($env:LOCALAPPDATA))"
 Log "executable: $BitcoindExe"
+Log "datadir:    $BitcoindDataDir  (pinned via -datadir; prevents 200+ GB Local\Bitcoin drift)"
+
+# Guard against the wrong-datadir orphan re-creating itself. If we
+# ever find Local\Bitcoin populated again, alert in the log.
+$_orphan = "C:\Users\dizzyvinci\AppData\Local\Bitcoin"
+if (Test-Path $_orphan) {
+    $orphSize = (Get-ChildItem -Path $_orphan -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+    if ($orphSize -gt 100MB) {
+        Log "WARNING: orphan datadir $_orphan exists with $([math]::Round($orphSize/1GB,2)) GB. Something is starting bitcoind WITHOUT our launcher (or without -datadir). Investigate before it grows more."
+    }
+}
 
 # Sanity: executable exists?
 if (-not (Test-Path $BitcoindExe)) {
@@ -86,7 +107,7 @@ if ($existing) {
     Log "found existing bitcoind PIDs: $(($existing | ForEach-Object Id) -join ', ')"
     Log "attempting graceful stop via bitcoin-cli"
     try {
-        & $BitcoinCli stop 2>&1 | ForEach-Object { Log "  cli stop: $_" }
+        & $BitcoinCli @BitcoinCliArgs stop 2>&1 | ForEach-Object { Log "  cli stop: $_" }
     } catch {
         Log "  cli stop threw: $_"
     }
@@ -135,8 +156,8 @@ for ($attempt = 1; $attempt -le $MAX_ATTEMPTS; $attempt++) {
         }
     }
     Log "starting fresh bitcoind hidden (attempt $attempt / $MAX_ATTEMPTS)"
-    $p = Start-Process -FilePath $BitcoindExe -WindowStyle Hidden -PassThru
-    Log "  started PID $($p.Id) at $(Get-Date -Format 'HH:mm:ss')"
+    $p = Start-Process -FilePath $BitcoindExe -ArgumentList $BitcoinCliArgs -WindowStyle Hidden -PassThru
+    Log "  started PID $($p.Id) at $(Get-Date -Format 'HH:mm:ss') with -datadir=$BitcoindDataDir"
     for ($i = 0; $i -lt $MaxWaitS; $i++) {
         if (Test-RpcAuth) {
             Log "  RPC up + auth OK after ${i}s on attempt $attempt"
@@ -155,10 +176,19 @@ if (-not $ready) {
 
 # Bonus: confirm wallet loaded (auto-load is set via wallet=satcoin in bitcoin.conf).
 try {
-    $wallets = & $BitcoinCli listwallets 2>&1
+    $wallets = & $BitcoinCli @BitcoinCliArgs listwallets 2>&1
     Log "wallets loaded: $wallets"
 } catch {
     Log "could not query wallets yet (still loading)"
+}
+
+# Final guard: confirm bitcoind is using the datadir we asked for.
+try {
+    $info = & $BitcoinCli @BitcoinCliArgs getblockchaininfo 2>&1 | ConvertFrom-Json
+    $sz = if ($info.size_on_disk) { [math]::Round($info.size_on_disk/1GB, 2) } else { "?" }
+    Log "node verified: $($info.blocks) blocks, $sz GB on disk at $BitcoindDataDir"
+} catch {
+    Log "could not query getblockchaininfo for datadir verification"
 }
 
 Log "=== launch_bitcoind done ==="
