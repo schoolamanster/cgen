@@ -46,14 +46,14 @@ $MaxWaitS        = 120  # how long to give bitcoind to come up after start
 # real one with our bitcoin.conf), sometimes %LOCALAPPDATA%\Bitcoin
 # (Local, where there's NO conf so it runs unpruned + cookie auth and
 # grows to hundreds of GB). Passing -datadir defeats the guess entirely.
-$BitcoindDataDir = "C:\Users\dizzyvinci\AppData\Roaming\Bitcoin"
+$BitcoindDataDir = if ($env:APPDATA) { Join-Path $env:APPDATA "Bitcoin" } else { "C:\Users\$env:USERNAME\AppData\Roaming\Bitcoin" }
 $BitcoinCliArgs  = @("-datadir=`"$BitcoindDataDir`"")
 
 # Log dir. Hardcoded path: this script lives only on dizzyvinci's machine and
 # Task-Scheduler invocations were observed to drop or interpret env vars
 # weirdly. The beacon write at the top of the script proves this path is
 # writable under both interactive and task contexts.
-$LogDir = "C:\Users\dizzyvinci\AppData\Local\BitcoinAutostart"
+$LogDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "BitcoinAutostart" } else { "C:\Users\$env:USERNAME\AppData\Local\BitcoinAutostart" }
 if (-not (Test-Path $LogDir)) {
     try { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null } catch { }
 }

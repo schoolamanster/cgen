@@ -33,7 +33,10 @@ param(
 
 $ErrorActionPreference = "Continue"
 $RepoRoot   = Resolve-Path (Join-Path $PSScriptRoot "..\..\..")
-$BitcoinDir = "C:\Users\dizzyvinci\AppData\Roaming\Bitcoin"
+# Use the CURRENT user's Roaming path — not hardcoded to 'dizzyvinci' —
+# so the script works whether the receiving user is dizzyvinci, infin,
+# or something else. Falls back only if $env:APPDATA is missing.
+$BitcoinDir = if ($env:APPDATA) { Join-Path $env:APPDATA "Bitcoin" } else { "C:\Users\$env:USERNAME\AppData\Roaming\Bitcoin" }
 $RemoteRoot = "infinityze:teleport/satcoin"
 $Launcher   = Join-Path $PSScriptRoot "launch_bitcoind.ps1"
 
