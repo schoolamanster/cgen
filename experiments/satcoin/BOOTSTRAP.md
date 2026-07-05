@@ -2,6 +2,8 @@
 
 Step-by-step from "fresh Windows machine" to running the live-mining pipeline + a passing verification on a real Bitcoin block. Time to first PASS: **~30 minutes of active work + 1-3 days of background bitcoind sync**.
 
+**Faster alternative if you already have another PC running the pipeline:** skip the bitcoind sync — see [scripts/POSEIDON-RESUME.md](scripts/POSEIDON-RESUME.md). Copy the wallet + pruned datadir over rclone Drive in ~30 min instead of syncing from scratch.
+
 Linux is similar — paths and the launcher script are Windows-specific, but `python verify_recent_winner.py` itself is platform-portable.
 
 ## What you'll have at the end
